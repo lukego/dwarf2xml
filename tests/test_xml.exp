@@ -1,0 +1,1348 @@
+#! /usr/bin/tclsh
+
+ # Copyright (C) 2013 by Emmanuel Azencot under the GNU GPL license 2.
+ # You should have received a copy of the licence 
+ # 
+ #                          Version 2, June 1991
+ #      Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+ #      675 Mass Ave, Cambridge, MA 02139, USA
+ #      
+ # GPL license along with this software os. if you did not you can find it
+ # at http://www.gnu.org/.
+ #
+ # # 
+ # # # project hosted at http://machinman.net/code/dwarf2xml
+ # #
+
+# Abstract :
+# This test (partly) compare dwarf2xml against dwarfdump
+# Xml output from dwarf2xml is read into a DOM tree
+# dwarfdump output is then parsed and acts like a SAX imput
+# which is used to compare and remove xml nodes from the DOM tree
+# At the end we should obtain an empty DOM tree.
+
+# Status :
+# Most of the tree verification are done
+# Some leaves checks have been left for future studies
+# Frame CIE/FDE check seems to be difficult as dwarfdump output an unrolled view
+# The remaining missing checks should be easier to implement.
+
+# Installation
+# Require (at least) package tcl, expect and tdom
+# dwarfdump may not be provided by linux distro. This is the case for fc17.
+# You can compile one from tgz distribution from http://reality.sgiweb.org/davea/
+# After having obtain dwarfdump version matching your /usr/include/libdwarf version
+# Change "dwarfdump" variable content to meet the executable, just below :
+set dwarfdump "../Ressources/libdwarf/dwarf-20110612/dwarfdump2/dwarfdump"
+
+# Running :
+# The test should succeed only with libdwarf/dwarfdump version ak 20110612
+# This same version of libdwarf must be installed on system libdwarf-devel-0.20110612-3
+# for dwarf2xml have same the version.
+
+package require Expect
+package require tdom
+
+if { [llength $argv] != 2 } { 
+   send_error "USAGE: $argv0 <xml> <elf>\n"
+   exit 1
+}
+set ELF [lindex $argv 1]
+if { ![file readable $ELF] } {
+   send_error "$argv0: can't read elf file \"$ELF\" \n"
+   exit 1
+}
+set XML [lindex $argv 0]
+if { ![file readable $XML] } {
+   send_error "$argv0: can't read xml file \"$XML\" \n"
+   exit 1
+}
+# http://tech.dir.groups.yahoo.com/group/tdom/message/840
+# http://www.opensource.apple.com/source/tcl/tcl-20/tcl_ext/tdom/tdom/lib/tdom.tcl coerce2string
+# Implemente "matches" function in tdom selectNodes xpath criteria
+proc ::dom::xpathFunc::matches {ctxNode pos nodeListNode nodeList args} {
+    if {[llength $args] != 4} {
+        error "matches(): wrong # of args!"
+    }
+    # send_user "::dom::xpathFunc::matches: args($args)\n"
+    set arg1Type  [lindex $args 0]
+    set arg1Value [join [lindex $args 1]]
+    set arg2Type  [lindex $args 2]
+    set arg2Value [lindex $args 3]
+    #foreach {arg1Type arg1Value arg2Type arg2Value} $args break
+    # send_user "::dom::xpathFunc::matches: arg1Type($arg1Type) arg1Value($arg1Value/[lindex $arg1Value 1]) arg2Type($arg2Type) arg2Value($arg2Value)\n";
+
+    set string  [::dom::xpathFuncHelper::coerce2string $arg1Type $arg1Value]
+    set pattern [::dom::xpathFuncHelper::coerce2string $arg2Type $arg2Value]
+    # send_user "::dom::xpathFunc::matches: regexp pattern($pattern) string($string)\n";
+
+    return [list bool [regexp $pattern $string]]
+}
+# compare 2 lists, returns a new list :
+# { "v" <index> <l1 remainings after index>  <l2 remainings after index> } : value at <index> differs
+# { "1" <index> {}  <l2 remainings after index> } : l1 end at index
+# { "2" <index> <l1 remainings after index>  {} } : l2 end at index
+# { "=" <index> {}  {} } : l1 and l2 are the same
+proc lcmp  { l1 l2 } {
+  for { set i 0; } { 1 } { incr i; } {
+    set clen "[expr [llength $l1] < $i][expr [llength $l2] < $i]"
+    send_user "clen($clen)\n"
+    switch $clen {
+    {11} { 
+      if { [lindex $l1 $i] != [lindex $l2 $i] } {
+        return [list v $i [lrange $l1 $i end] [lrange $l1 $i end]];
+      }
+    }
+    {01} { return [list "2" $i [lrange $l1 $i end] ""]; }
+    {10} { return [list "1" $i "" [lrange $l2 $i end]]; }
+    {00} { return [list "=" $i "" ""]; }
+    }
+    error "lcmp: bug #1\n"
+  }
+  error "lcmp: bug #2\n"
+}
+# Track TAG structures
+# This append a new level of tag structure in curent xml path
+proc xml_add_tag { dwnode path tag } {
+  set attr_id [regsub {^[^.]+@([^.]+)$} $tag {[@id="i:\1"]}]
+  set xpath [concat $path "*$attr_id" ]
+  send_user "xml_add_tag: xpath([join $xpath /]) tag($tag)\n"
+  set n_tag [$dwnode selectNodes [join $xpath /] res_type]
+  switch -regexp [$n_tag nodeName] {
+  {^tag_user$} {
+     set tag [string range [lindex [split $tag @] 0] 4 end]
+    if { $tag != [$n_tag getAttribute name] } \
+      { error "xml_add_tag: path($path) tag_user name \"$tag\" != \"[$n_tag getAttribute name]\"\n" }
+    set tag [$n_tag nodeName]
+    set tag "tag_user$attr_id"
+  }
+  default { 
+    set tag [regsub {@(.+)$} $tag {}]
+    if { $tag != [$n_tag nodeName] } \
+      { error "xml_add_tag: path($path) tag name dwd_tag($tag) != xml_tag([$n_tag nodeName])\n"; }
+    set tag "$tag$attr_id"
+    send_user "xml_add_tag: path($path) tag($tag)\n"
+  }
+  }
+  set xpath $path
+  lappend xpath $tag
+  send_user "xml_add_tag: path($path) -> xpath($xpath)\n"
+  return $xpath;
+}
+# This is called whel a tag structure finshes. 
+# It checks that the xml structure is empty and removes the tag node
+proc xml_del_tag { dwnode path } {
+    empty_node_delete $dwnode [join $path /] "/*"
+    send_user "xml_del_tag: path($path) deleted\n"
+    set path [lrange $path 0 end-1]
+    return $path;
+
+
+    set r_node [$dwnode selectNodes [join $path /] res_type]
+    if { $res_type != "nodes" } {
+       error "xml_del_tag: path($path) selectNodes returned a $res_type for r_node\n"
+    }
+    if { [llength $r_node] != 1 } {
+       error "xml_del_tag: path($path) selectNodes returned a non singleton as r_node($r_node)\n"
+    }
+    set childs [$r_node childNodes]
+    if { $childs != {} } {
+       foreach child $childs {
+         send_error "xml_del_tag: remaining nodes [$child nodeName]\n"
+       }
+       error "xml_del_tag: path($path) is not empty\n"
+    }
+    $r_node delete;
+    send_user "xml_del_tag: path($path) deleted\n"
+    set path [lrange $path 0 end-1]
+    return $path;
+}
+# Dwarfdump to XML attribute adaptation
+proc _at_txt_2_xml { dwnode cu_off at_name val } {
+  switch -regexp -matchvar vars $at_name {
+  {at_call_file$} -
+  {at_decl_file$} { return [lindex $val 0]; }
+  {at_SUN_func_offsets$} { return "<skip>"; }
+  }
+  # ex DW_AT_upper_bound   255(as signed = -1)
+  # {^([^\)]+)\([^\)]+\)$} { return [lindex $vars 1]; }
+  switch -regexp -matchvar vars $val {
+  {^DW_LANG_(.*)$} -
+  {^DW_ACCESS_(.*)$} -
+  {^DW_ATE_(.*)$} -
+  {^DW_INL_(.*)$} -
+  {^DW_VIRTUALITY_(.*)$} -
+  {^DW_VIS_(.*)$} -
+  {^DW_ID_(.*)$} -
+  {^DW_CC_(.*)$} { return [lindex $vars 1]; }
+  {^DW_ORD_row_major$} { return 0; }
+  {^DW_ATCF_SUN_func_start$} { return 68; }
+  {^no$} { return "false"; }
+  {^yes\(1\)$} { return "true"; }
+  {^([0-9]+)\(as signed = .+$} { return [lindex $vars 1]; }
+  {^<global die offset ([0-9]+)>$} { return [lindex $vars 1]; }
+  {^<([0-9]+)>$} { return [expr [lindex $vars 1] +$cu_off]; }
+  }
+  return $val
+}  
+# Frontend Dwarfdump to XML attribute adaptation, for debug
+proc at_txt_2_xml { dwnode cu_off at_name val } {
+  set _val [_at_txt_2_xml $dwnode $cu_off $at_name $val]
+  if { $_val != $val } {
+    send_user "at_txt_2_xml: val($val) -> _val($_val) \n"
+  }
+  return $_val
+}
+# Called when an attribute is encoded as an xml complex node structure
+proc at_xml_2_dwf { dwnode path at_name node val } {
+  switch -regexp -matchvar vars $at_name {
+  {at_location} -
+  {at_data_member_location} -
+  {at_vtable_elem_location} -
+  {at_frame_base} {
+    if { [$node nodeName] == "loc_const" } {
+      set content [string trim [[$node childNodes] data] " \t\r\n\xc2\xa0"]
+      if { $content != $val } {
+        error "at_xml_2_dwf: path($path/$at_name) xml($content) != val($val)\n"
+      }
+      $node delete
+      return "";
+    }
+
+    set xpath "loc_op"
+    set locs_n [$node selectNodes $xpath res_type]
+    send_user "at_xml_2_dwf/loc_op: res_type($res_type) locs_n($locs_n)\n"
+    if { $res_type == "nodes" } {
+      send_error "at_xml_2_dwf/loc_op: TODO value verification\n"
+      foreach loc_n $locs_n {
+        $loc_n delete
+      }
+      set locs_n [$node selectNodes $xpath res_type]
+      if { $res_type != "empty" } {
+        error "at_xml_2_dwf/loc_op: remaining node\n"
+      }
+      return "";
+    }
+    
+    foreach {loc_i loc_d} $val {
+      while { 1 } {
+        set low_pc [dict get $loc_d lowpc]
+        set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+        set low_pc "0x[string range $low_pc [expr [string length $low_pc] -16] end]"
+        set xpath "debug_loc/loc_list/loc_expr\[@low_pc=\"$low_pc\"\]"
+        set loc_n [$dwnode selectNodes $xpath res_type]
+        if { $res_type == "nodes" } { break; }
+        
+        set low_pc [dict get $loc_d lowpc]
+        set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+        set low_pc "0x[string range $low_pc [expr [string length $low_pc] -8] end]"
+        set xpath "debug_loc/loc_list/loc_expr\[@low_pc=\"$low_pc\"\]"
+        set loc_n [$dwnode selectNodes $xpath res_type]
+        if { $res_type == "nodes" } { break; }
+      
+        error "at_xml_2_dwf: xpath($xpath) selectNodes returned empty loc_n($loc_n)\n"
+      }
+      if { [llength $loc_n] != 1 } {
+        # TODO : add id on loc_list (1st loc_expr loc id)
+        send_error "at_xml_2_dwf: warning: xpath($xpath) selectNodes returned a non singleton as loc_n($loc_n)\n"
+        set loc_n [lindex $loc_n 0]
+      }
+      send_error "TODO : at_xml_2_dwf : incomplete loc verification\n"
+      $loc_n delete
+    }
+    return "";
+  }
+  }
+  error "at_node_2_dwf: no node conversion for at_name($at_name)\n"
+}
+# Main Attribute checker
+proc xml_hit_at { dwnode path cu_off at_name val } {
+  while { 1 } {
+    # set xpath [path_2_xpath "$path $at_name"]
+    set xpath [join "$path $at_name" /]
+    send_user "xml_hit_at: direct xpath($xpath)\n"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type == "nodes" } break;
+
+    # set xpath [path_2_xpath "$path at_user"]
+    set xpath [join "$path at_user\[@name=\"[string range $at_name 3 end]\"\]" /]
+    send_user "xml_hit_at: at_user xpath($xpath)\n"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type == "nodes" } break;
+
+    error "xml_hit_at: path($path/$at_name) selectNodes($xpath) returned $res_type\n"
+    
+  }
+  switch [llength $at_node] {
+  0 { error "xml_hit_at: path($path/$at_name) selectNodes returned an empty result: at_node($at_node)\n"; }
+  1 { }
+  default {
+    set refcont [[lindex $at_node 0] asList]
+    send_error "xml_hit_at: path($path/$at_name) selectNodes returned multiple result: at_node($at_node)\n";
+    foreach nod $at_node {
+      if { [$nod asList] != $refcont } {
+        error "xml_hit_at: Node content is not same among multiple occurences of same at nod([$nod asList]) != refcont($refcont)"
+      }
+    }
+    set at_node [lindex $at_node 0]
+  }
+  }
+  if { [$at_node nodeType] != "ELEMENT_NODE" } {
+    error "xml_hit_at: path($path/$at_name) selectNodes returned a non element node : [$at_node nodeType]\n"
+  }
+  set val [string trim $val " \t\r\n\xc2\xa0"]
+  set val [at_txt_2_xml $dwnode $cu_off $at_name $val]
+  set content {}
+  foreach nod [$at_node childNodes] {
+    if { [$nod nodeType] == "ELEMENT_NODE" } {
+      set content [at_xml_2_dwf $dwnode $path $at_name $nod $val]
+      $at_node delete
+      return;
+    }
+    if { [$nod nodeType] != "TEXT_NODE" } {
+      error "xml_hit_at: path($path/$at_name) returned non text childs : [$at_node nodeType]\n"
+    }
+    append content [string trim [$nod data] " \t\r\n\xc2\xa0"]
+  }
+  set content [string map {\\ {}} $content]
+  switch -regexp -matchvar vars $content {
+  {^\[(.*)\]} { set content [string map {{ } {}} [lindex $vars 1]]; }
+  }
+  if { $val != "<skip>" } {
+    if { $val != $content && ![string equal $val $content] } {
+       binary scan $content H* xml
+       binary scan $val H* dwd
+      send_error "xml_hit_at: path($path/$at_name) xml($xml) != val($dwd)\n"
+      error "xml_hit_at: path($path/$at_name) xml($content) != val($val)\n"
+    }
+  }
+  $at_node delete
+  return;
+}
+# AT_ranges attribute and section check
+proc xml_hit_at_range { discard dwnode path val rank lopc hipc } {
+  set xpath [join "$path at_ranges" /]
+  send_user "xml_hit_at_range: xpath($xpath)\n"
+  set at_node [$dwnode selectNodes $xpath res_type]
+  if { [llength $at_node] != 1 } {
+      error "xml_hit_at_range: xpath($xpath) returned non singleton at_node($at_node)\n"
+  }
+  set content [string trim [[$at_node childNodes] data] " \t\r\n\xc2\xa0"]
+  if { $val != $content } {
+      error "xml_hit_at_range: xpath($xpath) val($val) != content($content)\n"
+  }
+  set lopc "0x0+[string trimleft $lopc 0x]"
+  if { $hipc == -1 } {
+    set hipc "0x0+[string trimleft $hipc 0x]"
+    set xpath "debug_ranges/rg_range\[@id=\"rg:$val\"\]/rg_entry\[matches(@low_pc,\"$lopc\") and not(@high_pc)\]"
+  } else {
+    set hipc "0x0+[string trimleft $hipc 0x]"
+    set xpath "debug_ranges/rg_range\[@id=\"rg:$val\"\]/rg_entry\[matches(@low_pc,\"$lopc\") and matches(@high_pc,\"$hipc\")\]"
+  }
+  set at_node [$dwnode selectNodes $xpath res_type]
+  switch [llength $at_node] {
+  1 { }
+  0 { error "xml_hit_at_range: xpath($xpath) returned empty at_node($at_node)\n"; }
+  default { 
+    send_error "xml_hit_at_range: xpath($xpath) returned non singleton at_node($at_node)\n"; 
+    set at_node [lindex $at_node 0]
+  }
+  }
+  if { $discard } { $at_node delete; }
+}
+
+# The two following procs record expect_before section patern change
+# This one is the default
+proc exp_before_commons { DWF } {
+  expect_before -i $DWF \
+  eof { 
+    send_user "exp_before_commons: matched section(eof)\n";
+    dict set extra section {}
+    dict set extra param   {}
+    set exp_before_hit 1
+  } \
+  -re "^\[\n\r\]*(\\.debug_\[^:\n\r \t\]+)(\[^\n\r\]*)\[\n\r\]+" {
+    send_user "exp_before_commons: matched section($expect_out(1,string))\n";
+    dict set extra section $expect_out(1,string) 
+    dict set extra param   $expect_out(2,string)
+    set exp_before_hit 1
+  }
+}
+# debug_info and debug line are entrelaced in dwarfdump
+# exp_before_debug_info is used in both functions to trigger CU / lines changed
+proc exp_before_debug_info { DWF } {
+  expect_before -i $DWF \
+  eof { 
+    send_user "exp_before_debug_info: matched section(eof)\n";
+    dict set extra section {}
+    dict set extra param   {}
+    set exp_before_hit 1
+  } \
+  -re "^\[\n\r\]*(\\.debug_\[^:\n\r \t\]+)(\[^\n\r\]*)\[\n\r\]+" {
+    send_user "exp_before_debug_info: matched section($expect_out(1,string))\n";
+    dict set extra section $expect_out(1,string) 
+    dict set extra param   $expect_out(2,string)
+    set exp_before_hit 1
+  } \
+  -re "^\[\n\r\]*(COMPILE_UNIT)<header overall offset = (\[^>\]+)>:\[\n\r\]+" {
+    send_user "exp_before_debug_info: matched COMPILE_UNIT\n"
+    dict set extra section ".debug_info_cu"
+    dict set extra param   $expect_out(2,string)
+    set exp_before_hit 1
+  }
+}
+# Actual debug_info is parsed debug_info_cu and is trigered by COMPILE_UNIT
+proc debug_info  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "debug_info: processing .debug_info\n"
+  exp_before_debug_info $DWF
+  send -i $DWF "\n"
+  expect -i $DWF eof { };
+  return "";
+}
+#
+# Section debug_info parser and checker
+#
+proc debug_info_cu  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "debug_info_cu: processing .debug_info(COMPILE_UNIT)\n"
+
+  exp_before_debug_info $DWF
+  set cu 1
+  set level -1
+  set path {debug_info}
+
+  #xml_hit $dwnode $path
+
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^\[\n\r\]*<(\[^>\]*)><(\[^>\]*)>\tDW_TAG_(\[^\n\r\]*)\[\n\r\]+" {
+    send_user "matched info/tag([string trim $expect_out(0,string)])\n";
+    send -i $DWF "\n"
+    set lev [string trim $expect_out(1,string) "><" ]
+    set offset [expr [string trim $expect_out(2,string)] +[dict get $extra param] ];
+    if { $lev == 0 } { dict set extra cu_offset $offset }
+    set tag [string trim $expect_out(3,string)];
+    set tag "tag_$tag@$offset";
+    set delta [expr (($lev -$level) < -1)?-1:($lev -$level)];
+    send_user "matched lev($lev) level($level) delta($delta) tag($tag) offset($offset)\n";
+    switch $delta {
+     1 { set path [xml_add_tag $dwnode $path $tag]; }
+    -1 { 
+       for { set i [expr $level -$lev]; } { $i >= 0 } { incr i -1; } { 
+         set path [xml_del_tag $dwnode $path]; 
+       }
+       set path [xml_add_tag $dwnode $path $tag]
+     }
+     0 { set path [xml_add_tag $dwnode [xml_del_tag $dwnode $path] $tag]; }
+    default { error "Unexpected level delta lev($lev) -level($level)"; }
+    }
+    set level $lev;
+    send_user "matched path($path)\n";
+    exp_continue;
+  } \
+  -re "^\t\tDW_AT_ranges  *(\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched range()\n";
+    set at_ranges_val [expr ($expect_out(1,string) -1) +1]
+
+    set xpath "debug_info//*\[at_ranges=\"$at_ranges_val\"\]"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { [llength $at_node] == 0  } {
+      error "debug_info_cu.at_ranges: xpath($xpath) returned non singleton at_node($at_node)\n"
+    }
+    if { [llength $at_node] == 1 } { set discard 1; } else { set discard 0; }
+    send -i $DWF "\n";
+    expect -i $DWF -re "^\t\tranges: (\[^ \]+) at \\.debug_ranges offset (\[^ \]+) \\((0x\[^ \]+)\\) \\((\[^ \]+) bytes\\)\[\n\r\]+";
+    send_user "matched info/at_ranges([string trim $expect_out(0,string)])\n";
+    set loop [expr $expect_out(1,string) -1];
+    for { set i 0; } { $i < $loop } { incr i; } {
+      send -i $DWF "\n";
+      expect -i $DWF \
+      -re "^\t\t\t\\\[(\[0-9 \]+)\\\] range entry    (0x\[^ \]+) (0x\[^\n\r\]+)\[\n\r\]+" {
+        send_user "matched range([string trim $expect_out(0,string)])\n";
+        xml_hit_at_range $discard $dwnode $path $at_ranges_val $expect_out(1,string) $expect_out(2,string) $expect_out(3,string)
+      } \
+      -re "^\t\t\t\\\[(\[0-9 \]+)\\\] addr selection (0x\[^ \]+) (0x\[^\n\r\]+)\[\n\r\]+" {
+        send_user "matched range([string trim $expect_out(0,string)])\n";
+        if { ![regexp {^0xffff+$} $expect_out(2,string)] } { 
+          error "debug_info_cu.at_ranges: path($path) lopc($expect_out(2,string)) should match(0xf+f)\n"
+        }
+        xml_hit_at_range $discard $dwnode $path $at_ranges_val $expect_out(1,string) $expect_out(3,string) -1
+      }
+    }
+    send -i $DWF "\n";
+    expect -i $DWF -re "^\t\t\t\\\[(\[0-9 \]+)\\\] range end      (0x\[^ \]+) (0x\[^\n\r\]+)\[\n\r\]+" 
+    send_user "matched range([string trim $expect_out(0,string)])\n";
+    set xpath "debug_ranges/rg_range\[@id=\"rg:$at_ranges_val\"\]/rg_entry\[not(@low_pc)\]"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { [llength $at_node] != 1 } {
+      error "debug_info_cu.at_ranges: xpath($xpath) returned non singleton at_node($at_node)\n"
+    }
+    if { $discard } {
+      $at_node delete; 
+    
+      # check ranges chuck empty
+      empty_node_delete $dwnode "debug_ranges/rg_range\[@id=\"rg:$at_ranges_val\"\]" "/*"
+    }
+    xml_hit_at $dwnode $path [dict get $extra param] "at_ranges" $at_ranges_val
+
+    send -i $DWF "\n";
+    exp_continue;
+  } \
+  -re "^\t\tDW_AT_(\[^ \]+) +<loclist with (\[^ \]+) entries follows>\[\n\r\]+" {
+    send_user "matched loclist([string trim $expect_out(0,string)])\n";
+    set at $expect_out(1,string);
+    set at "at_[string trim $at]";
+    set loop $expect_out(2,string);
+    for { set i 0; } { $i < $loop } { incr i; } {
+      send -i $DWF "\n";
+      expect -i $DWF -re "^\t\t\t\\\[(\[0-9 \]+)\\\]<lowpc=(0x\[^>\]+)><highpc=(0x\[^>\]+)>(\[^\n\r\]+)\[\n\r\]+" 
+      send_user "matched location([string trim $expect_out(0,string)]) index($i)/loop($loop)\n";
+      dict set loclist $i lowpc  $expect_out(2,string)
+      dict set loclist $i highpc $expect_out(3,string)
+      dict set loclist $i val    $expect_out(4,string)
+    }
+    xml_hit_at $dwnode $path [dict get $extra param] $at $loclist
+    unset loclist 
+    send -i $DWF "\n";
+    exp_continue;
+  } \
+  -re "^\t\tDW_AT_(SUN_func_offsets) +\[\n\r\]+" {    
+# dwarfdump sparc/tcombined.o :
+# 		DW_AT_SUN_func_offsets      
+#   0x00000004
+# <1><  298>	DW_TAG_base_type
+    set at $expect_out(1,string);
+    set at "at_[string trim $at]";
+    send -i $DWF "\n"
+    expect -re "^  (0x\[^\n\r\]+)\[\n\r\]+"
+    send_user "matched level($level) path($path) at($at)\n";
+    xml_hit_at $dwnode $path [dict get $extra param] $at $expect_out(1,string)
+
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  -re "^\t\tDW_AT_(.\{22\})(\[^\n\r\]*)\[\n\r\]+" {
+    set at $expect_out(1,string);
+    set at "at_[string trim $at]";
+    send_user "matched level($level) path($path) at($at) val($expect_out(2,string))\n";
+    xml_hit_at $dwnode $path [dict get $extra param] $at $expect_out(2,string)
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  -re "^\t\t<Unknown AT value (0x\[^>\]+)>(\[^\n\r\]*)\[\n\r\]+" {
+    set at "at_unk\[@name=\"attr_[string trim $expect_out(1,string)]\"\]";
+    send_user "matched level($level) path($path) at($at)\n";
+    xml_hit_at $dwnode $path [dict get $extra param] $at $expect_out(2,string)
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  "^LOCAL_SYMBOLS:\[\n\r\]*" { send -i $DWF "\n"; exp_continue; } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     # send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  for { set i $level; } { $i >= 0 } { incr i -1; } { 
+    set path [xml_del_tag $dwnode $path]; 
+  }
+
+  return "";
+}
+#
+# Section debug_line parser and checker
+#
+proc sl_hit_line { dwnode low_pc extra_var } {
+  upvar 1 $extra_var extra
+  while { 1 } {
+    set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+    set low_pc "0x[string range $low_pc [expr [string length $low_pc] -16] end]"
+    # Should add line number in selection
+    set xpath "debug_line/sl_compile_unit\[@ref=\"i:[dict get $extra cu_offset]\"\]/sl_lines/sl_line\[sl_low_pc=\"$low_pc\"\]"
+    send_user "sl_hit_line: xpath($xpath)\n"
+    set sl_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type == "nodes" } { break; }
+
+    set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+    set low_pc "0x[string range $low_pc [expr [string length $low_pc] -8] end]"
+    # Should add line number in selection
+    set xpath "debug_line/sl_compile_unit\[@ref=\"i:[dict get $extra cu_offset]\"\]/sl_lines/sl_line\[sl_low_pc=\"$low_pc\"\]"
+    send_user "sl_hit_line: xpath($xpath)\n"
+    set sl_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type == "nodes" } { break; }
+
+    error "sl_hit_line: xpath($xpath) res_type($res_type) != nodes"
+  }
+  if { [llength $sl_node] != 1 } {
+    #foreach nod $sl_node { send_error "sl_hit_line: xpath($xpath) sl_low_pc([[$nod getElementsByTagName sl_low_pc] text])\n"; }
+    foreach nod $sl_node { send_error "sl_hit_line: xpath($xpath) sl_line id([$nod getAttribute id])\n"; }
+    send_error "sl_hit_line: xpath($xpath) selectNodes returned a non singleton as sl_node($sl_node)\n"
+  }
+  set sl_node [lindex $sl_node 0]
+  set sl_file_id [[$sl_node getElementsByTagName sl_decl] getAttribute file]
+  $sl_node delete
+  return $sl_file_id
+}
+proc sl_hit_file { dwnode sl_file_id file_name extra_var } {
+  upvar 1 $extra_var extra
+    set xpath "debug_line/sl_compile_unit\[@ref=\"i:[dict get $extra cu_offset]\"\]/sl_files/sl_file\[@id=\"$sl_file_id\"\]"
+    send_user "sl_hit_file: xpath($xpath)\n"
+    set sl_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type != "nodes" } {
+      send_error "sl_hit_file: xpath($xpath) res_type($res_type) != nodes\n"
+      return
+    }
+    send_error "sl_hit_file: TODO : check file name etc ...\n"
+    $sl_node delete
+}
+# Main debug_line parser
+proc debug_line  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_line\n"
+  exp_before_debug_info $DWF
+  send -i $DWF "\n"
+  expect -i $DWF -re "^\[\n\r\]*Source lines \\(from CU-DIE at \\.debug_info offset (\[^)\]+)\\):\[\n\r\]+" {
+    dict set extra cu_offset $expect_out(1,string)
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+  }
+  if { [info exist exp_before_hit] } return "";
+  send -i $DWF "\n"
+  expect -i $DWF -re "^<pc> +\\\[row,col\\\] NS BB ET uri: \"filepath\"\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+  } 
+  if { [info exist exp_before_hit] } return "";
+  send -i $DWF "\n"
+  expect -i $DWF -re "^NS new statement, BB new basic block, ET end of text sequence\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+  } 
+  if { [info exist exp_before_hit] } return "";
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(0x\[^ \]+)  \\\[(\[^,\]+),(\[ 0-9-\]+)\\\] (NS|ET|BB) (NS|ET|BB) uri: \"(\[^\"\]+)\"\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    set sl_file_id [sl_hit_line $dwnode $expect_out(1,string) extra]
+    sl_hit_file $dwnode $sl_file_id $expect_out(6,string) extra
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(0x\[^ \]+)  \\\[(\[^,\]+),(\[ 0-9-\]+)\\\] (NS|ET|BB) uri: \"(\[^\"\]+)\"\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    set sl_file_id [sl_hit_line $dwnode $expect_out(1,string) extra]
+    sl_hit_file $dwnode $sl_file_id $expect_out(5,string) extra
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  -re "^(0x\[^ \]+)  \\\[(\[^,\]+),(\[ 0-9-\]+)\\\] uri: \"(\[^\"\]+)\"\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    set sl_file_id [sl_hit_line $dwnode $expect_out(1,string) extra]
+    sl_hit_file $dwnode $sl_file_id $expect_out(4,string) extra
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(0x\[^ \]+)  \\\[\[^,\]+,(\[ 0-9-\]+)\\\] (NS|ET|BB) (NS|ET|BB)\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    sl_hit_line $dwnode $expect_out(1,string) extra
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(0x\[^ \]+)  \\\[\[^,\]+,(\[ 0-9-\]+)\\\] (NS|ET|BB)\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    sl_hit_line $dwnode $expect_out(1,string) extra
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(0x\[^ \]+)  \\\[\[^,\]+,(\[ 0-9-\]+)\\\]\[\n\r\]+" {
+    send_user "matched Source lines([string trim $expect_out(0,string)])\n";
+    sl_hit_line $dwnode $expect_out(1,string) extra
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  return "";
+}
+#
+# Section debug_macinfo parser and checker
+#
+proc debug_macinfo  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_macinfo\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^compilation-unit .debug_macinfo # (\[0-9\]+)\[\n\r\]+" {
+     send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+     set cu [string trim $expect_out(1,string)]
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^num name section-offset file-index \\\[line\\\] \"string\"\[\n\r\]+" {
+     send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^ *(\[0-9\]+) DW_MACINFO_type-code-0: +(\[0-9\]+) +-1 \\\[ *(\[0-9\]+)\\\] (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched macinfo_type-code-0([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^ *(\[0-9\]+) DW_MACINFO_(\[^:\]+): +(\[0-9\]+) +(\[0-9-\]+) \\\[ *(\[0-9\]+)\\\] (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+    set id "mac:${cu}m[expr [string trim $expect_out(1,string)] +1]"
+    set xpath "debug_macinfo/mac_compile_unit\[@id=\"mac:$cu\"\]/macro\[@id=\"$id\"\]"
+    set mac_node [$dwnode selectNodes $xpath res_type]
+    if { $res_type != "nodes" } {
+      error "debug_macinfo: xpath($xpath) res_type($res_type) != nodes\n"
+      return
+    }
+    send_error "debug_macinfo: TODO : check mac content ...\n"
+    if { [string trim $expect_out(2,string)] != [$mac_node getAttribute "type"] } {
+      error "debug_macinfo: xpath($xpath) type([string trim $expect_out(2,string)]) != type([$mac_node getAttribute \"type\"])\n"
+    }
+    if { [string trim $expect_out(4,string)] != [$mac_node getAttribute "file"] } {
+      error "debug_macinfo: xpath($xpath) file([string trim $expect_out(4,string)]) != file([$mac_node getAttribute \"file\"])\n"
+    }
+    if { [string trim $expect_out(5,string)] != [$mac_node getAttribute "line"] } {
+      error "debug_macinfo: xpath($xpath) line([string trim $expect_out(5,string)]) != line([$mac_node getAttribute \"line\"])\n"
+    }
+    set content {}
+    foreach n_mac [$mac_node childNodes] {
+      append content [string trim [$n_mac data] " \t\r\n\xc2\xa0"]
+    }
+    switch [$mac_node getAttribute "type"] {
+    {start_file} -
+    {end_file} { append content "0"; }
+    }
+    # $expect_out(6,string) : Macro text does not contain '\' wich have been suppressed by expect ?
+    set dwd_content [string trim $expect_out(6,string) " \t\r\n\""]
+    set xml_content [string trim $content " \t\r\n\""]
+    set xml_content [string map {\\ {}} $xml_content]
+    if { $dwd_content != $xml_content } {
+      error "debug_macinfo: xpath($xpath) dwd_content($dwd_content) != xml_content($xml_content)\n"
+    }
+    
+    $mac_node delete
+
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^Macro counts: start file (\[0-9\]+), end file (\[0-9\]+), define (\[0-9\]+), undef (\[0-9\]+), ext (\[0-9\]+), code-zero (\[0-9\]+), unknown (\[0-9\]+)\[\n\r\]+" {
+     send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^Counts of DW_MACINFO file \\(\[0-9\]+\\) end_file \\(\[0-9\]+\\) do not match!\\.\[\n\r\]+" {
+     send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^DW_MACINFO file count of zero is invalid DWARF2/3\[\n\r\]+" {
+     send_user "matched macinfo([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  return "";
+}
+proc ab_del_tag { dwnode ab_id } {
+  send_user "ab_del_tag: ab_id($ab_id)\n"
+  set xpath "debug_abbrev/ab_table/ab_tag\[@id=\"$ab_id\"\]"
+  empty_node_delete $dwnode $xpath "/*"
+  return
+}
+
+proc debug_abbrev { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  set ab_id {}
+  set cu_offset -1
+  send_user "processing .debug_abbrev\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^<(\[^>\]+)><(\[^>\]+)><code:(\[^>\]+)> DW_TAG_(\[^ \]+) *DW_children_(\[^\n\r\]+)\[\n\r\]+" {
+    if { $ab_id != {} } {
+      ab_del_tag $dwnode $ab_id
+    }
+    send_user "matched abbrev([string trim $expect_out(0,string)])\n";
+    set tag "tag_$expect_out(4,string)]"
+    set ab_code [string trim $expect_out(3,string)]
+    while { 1 } {
+      set xpath "debug_abbrev/ab_table\[@id=\"ab:$cu_offset\"\]/ab_tag\[matches(@id,\"ab:\[0-9\]+c$ab_code\$\")\]"
+      send_user "debug_abbrev: xpath($xpath)\n"
+      set ab_node [$dwnode selectNodes $xpath res_type]
+      if { $res_type == "nodes" } { break; }
+
+      set cu_offset [string trim $expect_out(2,string)]; 
+      set xpath "debug_abbrev/ab_table\[@id=\"ab:$cu_offset\"\]/ab_tag\[matches(@id,\"ab:\[0-9\]+c$ab_code\$\")\]"
+      send_user "debug_abbrev: xpath($xpath)\n"
+      set ab_node [$dwnode selectNodes $xpath res_type]
+      if { $res_type == "nodes" } { break; }
+
+      error "debug_abbrev: xpath($xpath) res_type($res_type) != nodes"
+    }
+    set ab_id [$ab_node getAttribute id]
+
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  -re "^      <(\[^>\]+)>\tDW_AT_(\[^ \]+) *DW_FORM_(\[^ \]+)\[\n\r\]+" {
+    send_user "matched abbrev([string trim $expect_out(0,string)])\n";
+    set at_name [string trim $expect_out(2,string)]; 
+    set xpath "debug_abbrev/ab_table\[@id=\"ab:$cu_offset\"\]/ab_tag\[@id=\"$ab_id\"\]/ab_attr\[@name=\"$at_name\"\]"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { [llength $at_node] != 1 } {
+      send_error "debug_abbrev: warning: xpath($xpath) selectNodes returned a non singleton as at_node($at_node)\n"
+      set at_node [lindex $at_node 0]
+    }
+    set dwd_form [string trim $expect_out(3,string)]
+    set xml_form [$at_node getAttribute "form"]
+    if { $dwd_form != $xml_form } {
+      error "debug_abbrev: xpath($xpath) dwd_form($dwd_form) != xml_form($xml_form)\n"
+    }
+    $at_node delete
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^      <(\[^>\]+)>\t<Unknown AT value (0x\[^>\]+)> +DW_FORM_(\[^ \]+)\[\n\r\]+" {
+    send_user "matched abbrev([string trim $expect_out(0,string)])\n";
+    set at_name "attr_[string trim $expect_out(2,string)]"; 
+    set xpath "debug_abbrev/ab_table\[@id=\"ab:$cu_offset\"\]/ab_tag\[@id=\"$ab_id\"\]/ab_attr\[@name=\"$at_name\"\]"
+    set at_node [$dwnode selectNodes $xpath res_type]
+    if { [llength $at_node] != 1 } {
+      send_error "debug_abbrev: warning: xpath($xpath) selectNodes returned a non singleton as at_node($at_node)\n"
+      set at_node [lindex $at_node 0]
+    }
+    set dwd_form [string trim $expect_out(3,string)]
+    set xml_form [$at_node getAttribute "form"]
+    if { $dwd_form != $xml_form } {
+      error "debug_abbrev: xpath($xpath) dwd_form($dwd_form) != xml_form($xml_form)\n"
+    }
+    $at_node delete
+
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^<(\[^>\]+)><(\[^>\]+)><code:  0> null .debug_abbrev entry\[\n\r\]+"  {
+    send_user "matched abbrev([string trim $expect_out(0,string)])\n";
+    if { $ab_id != {} } {
+      ab_del_tag $dwnode $ab_id
+    }
+    set ab_id [split $ab_id "c"]
+    lset ab_id 1 [expr [lindex $ab_id 1] +1]
+    set ab_id [join $ab_id "c"]
+    set xpath "debug_abbrev/ab_table\[@id=\"ab:$cu_offset\"\]/ab_tag\[@id=\"$ab_id\"\]"
+    send_user "debug_abbrev: xpath($xpath)\n"
+    set ab_node [$dwnode selectNodes $xpath res_type]
+    if { [llength $ab_node] != 1 } {
+      send_error "debug_abbrev: warning: xpath($xpath) selectNodes returned a non singleton as ab_node($ab_node)\n"
+    } else {
+      $ab_node delete
+    }
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  if { $ab_id != {} } {
+    ab_del_tag $dwnode $ab_id
+  }
+  return "";
+}
+proc debug_string  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_string\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^name at offset (\[^,\]+), length (\[^ \]+) is (\[^\n\r\]*)\[\n\r\]+" {
+    send_user "matched string([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  return "";
+}
+proc debug_aranges  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_aranges\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^\[\n\r\]*arange starts at 0x0, length of 0, cu_die_offset = (\[^\)\]+)\[\n\r\]*" {
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\[\n\r\]*arange starts at (0x\[^,\]+), length of (\[^,\]+), cu_die_offset = (\[^\)\]+)\[\n\r\]*" {
+     send_user "matched aranges([string trim $expect_out(0,string)])\n";
+    while { 1 } {
+      set cu_offset [string trim $expect_out(3,string)]
+      set low_pc [string trim $expect_out(1,string)]
+
+      set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+      set low_pc "0x[string range $low_pc [expr [string length $low_pc] -16] end]"
+      set xpath "debug_aranges/arange\[@ref=\"i:$cu_offset\" and @low_pc=\"$low_pc\"\]"
+      send_user "debug_aranges: xpath($xpath)\n"
+      set ar_node [$dwnode selectNodes $xpath res_type]
+      if { $res_type == "nodes" } { break; }
+
+      set low_pc "000000000000000000000[string trimleft $low_pc 0x]"
+      set low_pc "0x[string range $low_pc [expr [string length $low_pc] -8] end]"
+      set xpath "debug_aranges/arange\[@ref=\"i:$cu_offset\" and @low_pc=\"$low_pc\"\]"
+      send_user "debug_aranges: xpath($xpath)\n"
+      set ar_node [$dwnode selectNodes $xpath res_type]
+      if { $res_type == "nodes" } { break; }
+
+      error "debug_aranges: xpath($xpath) res_type($res_type) != nodes"
+    } 
+    if { [llength $ar_node] != 1 } {
+      foreach nod $ar_node { send_error "debug_aranges: xpath($xpath) arange([$nod getAttribute id])\n"; }
+      send_error "debug_aranges: xpath($xpath) selectNodes returned a non singleton as ar_node($ar_node)\n"
+    }
+    set ar_node [lindex $ar_node 0]
+    $ar_node delete
+
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\[\n\r\]*COMPILE_UNIT.*<header overall offset = (\[^>\]*)>:\[\n\r\]*" {
+     send_user "matched aranges([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^<0><(\[^>\]+)>	DW_TAG_(\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\t\tDW_AT_(\[^ \]+) +(\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\t\t<Unknown AT value (0x\[^>\]+)> +(\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\t\tranges: (\[^ \]+) at .debug_ranges offset (\[^ \]+) \\((0x\[^)\]+)\\) \\((\[^ \]+) bytes\\)\[\n\r\]+" {
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+    set loop [expr $expect_out(1,string) -1];
+    for { set i 0; } { $i < $loop } { incr i; } {
+      send -i $DWF "\n";
+      expect -i $DWF \
+      -re "^\t\t\t\\\[(\[0-9 \]+)\\\] range entry    0x(\[^ \]+) 0x(\[^\n\r\]*)\[\n\r\]+" {
+         send_user "matched aranges([string trim $expect_out(0,string)])\n";
+      } \
+      -re "^\t\t\t\\\[(\[0-9 \]+)\\\] addr selection (0x\[^ \]+) (0x\[^\n\r\]+)\[\n\r\]+" {
+         send_user "matched aranges([string trim $expect_out(0,string)])\n";
+      }
+    }
+    send -i $DWF "\n";
+    expect -i $DWF -re "^\t\t\t\\\[(\[0-9 \]+)\\\] range end      0x(\[^ \]+) 0x(\[^\n\r\]*)\[\n\r\]+" 
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+    send -i $DWF "\n";
+    exp_continue;
+  } \
+  -re "^arange starts at 0x0, length of 0, cu_die_offset = (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched aranges([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  return "";
+}
+proc debug_frame  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_frame\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF -re "^\[\n\r\]*fde:\[\n\r\]+" {
+    send_user "matched frame([string trim $expect_out(0,string)])\n";
+  }
+  if { [info exist exp_before_hit] } return "";
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^<(\[^>\]+)><(0x\[^:\]+):(0x\[^>\]+)><(.*)><fde offset (0x\[^ \]+) length: (0x\[^>\]+)><eh offset none>\[\n\r\]+" {
+    send_user "matched frame([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^ +(0x\[^:\]+):\t(<\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched frame([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^... DWARF CHECK: (\[^\n\r\]+)...\[\n\r\]+" {
+    send_user "matched frame([string trim $expect_out(0,string)])\n";
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "debug_frame: eating CR, ";
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc debug_pubnames  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_pubname\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+ +)die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched pubnames([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_pubnames/pubname\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_pubnames: xpath($xpath)\n"
+    set pub_node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_aranges: xpath($xpath) res_type($res_type) != nodes"
+     }
+     $pub_node delete
+     send_error "debug_pubnames: check pubname content\n"
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  }
+  return "";
+}
+proc debug_static_func  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_static_func\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+ +)die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched static_func([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_funcnames/funcname\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_funcnames: xpath($xpath)\n"
+    set node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_funcnames: xpath($xpath) res_type($res_type) != nodes"
+     }
+     $node delete
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc debug_static_vars  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_static_vars\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+ +)die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched static_vars([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_varnames/varname\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_varnames: xpath($xpath)\n"
+    set node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_varnames: xpath($xpath) res_type($res_type) != nodes"
+     }
+     $node delete
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc debug_weaknames  { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_weaknames\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+) +die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched weaknames([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_weaknames/weakname\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_weaknames: xpath($xpath)\n"
+    set node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_weaknames: xpath($xpath) res_type($res_type) != nodes"
+     }
+    if { [llength $node] != 1 } {
+      foreach nod $node {
+        set attr {}
+        foreach at [$nod attributes] { append attr " $at=[$nod getAttribute $at]"; }
+        send_error "debug_weaknames: warning: multiple node([$nod nodeName] attr($attr)\n"
+      }
+    }
+    [lindex $node 0] delete
+
+    send -i $DWF "\n"
+    exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc debug_typenames { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_typenames\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+ +)die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched typenames([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_typenames/typename\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_typenames: xpath($xpath)\n"
+    set node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_typenames: xpath($xpath) res_type($res_type) != nodes"
+     }
+     $node delete
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc debug_pubtypes { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  send_user "processing .debug_pubtypes\n"
+  exp_before_commons $DWF
+  send -i $DWF "\n"
+  expect -i $DWF \
+  -re "^(\[^ \]+) (.+ +)die-in-sect (\[^,\]+), cu-in-sect (\[^,\]+), die-in-cu (\[^,\]+), cu-header-in-sect (\[^\n\r\]+)\[\n\r\]+" {
+    send_user "matched pubtypes([string trim $expect_out(0,string)])\n";
+    set cu_offset [string trim $expect_out(3,string)]
+    set xpath "debug_pubtypes/pubtype\[@ref=\"i:$cu_offset\"\]"
+    send_user "debug_pubtypes: xpath($xpath)\n"
+    set node [$dwnode selectNodes $xpath res_type]
+     if { $res_type != "nodes" } {
+       error "debug_pubtypes: xpath($xpath) res_type($res_type) != nodes"
+     }
+     $node delete
+     send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "^\n|\r" {
+     send_user "eating CR, ";
+     exp_continue;
+  } \
+  -re "^(\[^\n\r\]+)\[\n\r\]+" {
+     send_user "unmatched <<<$expect_out(buffer)>>>\n";
+     exp_continue;
+  }
+  return "";
+}
+proc empty_node_delete { dwnode node_path sub_path } {
+  set xpath "$node_path$sub_path"
+  set residus [$dwnode selectNodes $xpath res_type]
+  if { $res_type != "empty" } {
+    set max_print 5
+    set attr ""
+    foreach nod $residus {
+      set attr {}
+      foreach at [$nod attributes] { append attr " $at=[$nod getAttribute $at]"; }
+      send_error "empty_node_delete: left residus([$nod nodeName]) attr($attr) in xpath($xpath)\n"
+      incr max_print -1
+      if { $max_print == 0 } break;
+    }
+    error "empty_node_delete: selectNodes xpath($xpath) non empty : res_type($res_type)\n"
+  }
+  set xpath "$node_path"
+  set node [$dwnode selectNodes $xpath res_type]
+  if { $res_type == "empty" } {
+    # error "empty_node_delete: selectNodes xpath($xpath) returned empty : res_type($res_type)\n"
+    return
+  }
+  $node delete
+}
+proc section_demux { DWF dwnode extra_var } {
+  upvar 1 $extra_var extra
+  set section_id [string range [dict get $extra section] 1 end]
+  send_user "section_demux: calling $section_id function extra($extra)\n"
+  $section_id $DWF $dwnode extra;
+  send_user "section_demux: returned from $section_id function extra($extra) \n"
+  switch $section_id {
+    "debug_info"        { }
+    "debug_info_cu"     {
+      send_user "section_demux: post processing debug_info_cu\n";
+      # set xpath "debug_info/*\[@id=\"i:[dict get $extra cu_offset]\"\]"
+      # empty_node_delete $dwnode $xpath "/*"
+    }
+    "debug_line"        {
+      send_user "section_demux: post processing sl_compile_unit\n";
+      set xpath "$section_id/sl_compile_unit\[@ref=\"i:[dict get $extra cu_offset]\"\]"
+      empty_node_delete $dwnode $xpath "/sl_lines/*"
+    }
+    "debug_abbrev"      {
+      send_user "section_demux: post processing debug_abbrev\n";
+      set xpath "$section_id"
+      empty_node_delete $dwnode $xpath "/ab_table/*"
+    }
+    "debug_frame"       {
+      send_user "section_demux: post processing debug_frame\n";
+      set xpath "$section_id/*"
+      set residus [$dwnode selectNodes $xpath res_type]
+      foreach nod $residus {
+        send_error "section_demux: TODO: check [$nod nodeName] content\n"
+        $nod delete
+      }
+    }
+    "debug_macinfo"     {
+      send_user "section_demux: post processing $section_id\n";
+      set xpath "$section_id"
+      empty_node_delete $dwnode $xpath "/mac_compile_unit/*"
+    }
+    "debug_string"      -
+    "debug_aranges"     -
+    "debug_pubnames"    -
+    "debug_pubtypes"    -
+    "debug_static_func" -
+    "debug_static_vars" -
+    "debug_weaknames"   -
+    "debug_typenames"   {
+      send_user "section_demux: post processing section_id($section_id)\n";
+      set xpath "$section_id"
+      empty_node_delete $dwnode $xpath "/*"
+    }
+    default {
+      error "section_demux: no entry for section([lindex $sec_info 0]) found"
+    }
+  }
+  return ;
+}
+spawn ./line_on_demand.sh $dwarfdump $ELF
+set DWF $spawn_id
+match_max -d 160
+
+# Read xml into DOM doc
+set fp [open $XML]
+dom parse -channel $fp doc
+close $fp; unset fp
+$doc documentElement dwnode
+if { [$dwnode nodeName] != "dwarf" } {
+  send_error "$::argv0: doc is not dwarf type\n"
+  exit 1;
+}
+if { [$dwnode getAttribute "producer"] != "dwarf2xml" } {
+  send_error "$::argv0: doc producer is not dwarf2xml\n"
+  exit 1;
+}
+if { [$dwnode getAttribute "file"] != "$ELF" } {
+  send_error "$::argv0: warning doc file is not $ELF\n"
+  #exit 1;
+}
+set timeout -1
+expect -i $DWF "cmde ready" {} eof { exit 1; }
+send_user "starting\n";
+send -i $DWF "\n"
+expect -i $DWF \
+  eof { } \
+  -re "^\[\n\r\]*(\\.debug_\[^:\n\r \t\]+)(\[^\n\r\]*)\[\n\r\]+" {
+    dict set sec_info section $expect_out(1,string) 
+    dict set sec_info param   $expect_out(2,string)]
+    while { [dict get $sec_info section] != "" } {
+      section_demux $DWF $dwnode sec_info;
+    }
+    if { ![catch {send -i $DWF "\n"}] } { exp_continue; }
+  } \
+  -re "^\n|\r" {
+     send_error "eating <<<CR>>>\n";
+     #send -i $DWF "\n"
+     exp_continue;
+  } \
+  -re "(\[^\n\]+)\[\n\r\]+" {
+     send_error "unmatched <<<$expect_out(buffer)>>>\n";
+     send -i $DWF "\n"
+     exp_continue;
+  }
+
+send_user "test ok\n"
