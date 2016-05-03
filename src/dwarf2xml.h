@@ -16,7 +16,7 @@
 #ifndef _DWARF2XML_H_ /* [ */
 #define _DWARF2XML_H_
 
-#include <dwarf_val_2_str.h>
+#include <dwarf_val_to_str.h>
 
 /* Stringification of VERSION (from gcc/cpp manual) */
 #define xstr(s) str(s)
