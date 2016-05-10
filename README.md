@@ -13,4 +13,7 @@ License is GPLv2 (according to the author), license file not included, since it 
 
 ## Errors and todo
 
-- Library search does not quite work yet (work in progress)
+- Library search does not quite work yet (work in progress), that's why wrong
+  libdwarf.h gets picked up on FreeBSD. Need to find the libraries and set the
+  path.
+
