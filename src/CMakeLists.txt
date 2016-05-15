@@ -53,12 +53,20 @@ add_executable(dwarf2xml
   ring.c
 )
 
+## Thirdparty libelf breaks the build on FreeBSD, but clearly there needs to be a way to get it to work
+if (NOT ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
+  target_include_directories(dwarf2xml
+    PRIVATE
+    ${LIBELF_INCLUDE_DIRS}
+  )
+endif()
+
 target_include_directories(dwarf2xml
   PRIVATE
   ${LIBDWARF_INCLUDE_DIRS}
 )
 
 target_link_libraries(dwarf2xml
-  ${LIBDWARF_LIBRARIES}
   ${LIBELF_LIBRARIES}
+  ${LIBDWARF_LIBRARIES}
 )
