@@ -20,7 +20,7 @@
 #include <dwarf.h>
 #include <libdwarf.h>
 
-#include <config.h>
+#include "config.h"
 #include "exception.h"
 #include "dwarf2xml.h"
 /*

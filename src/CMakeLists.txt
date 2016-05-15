@@ -1,6 +1,7 @@
-# Find dwarf.h header
-# TODO need full blown library search, this is incorrect
-find_file(DWARF_H_PATH dwarf.h)
+find_package(LibDwarf REQUIRED)
+
+# dwarf.h header to scrape
+set(DWARF_H_PATH "${LIBDWARF_INCLUDE_DIRS}/dwarf.h")
 
 ##### Generate dwarf_val_to_str.c
 set(DWARF_TABLE_SRC ${CMAKE_CURRENT_BINARY_DIR}/dwarf_val_to_str.c) # Generated file
@@ -41,7 +42,7 @@ execute_process(
 file(APPEND ${DWARF_TABLE_HEADER} "${DEFINITIONS}")
 
 # Pull in generated header
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
+include_directories(${CMAKE_CURRENT_BINARY_DIR} ${LIDWARF_INCLUDE_DIRS})
 
 add_executable(dwarf2xml
   dwarf_val_to_str.c
@@ -52,3 +53,12 @@ add_executable(dwarf2xml
   ring.c
 )
 
+target_include_directories(dwarf2xml
+  PRIVATE
+  ${LIBDWARF_INCLUDE_DIRS}
+)
+
+target_link_libraries(dwarf2xml
+  ${LIBDWARF_LIBRARIES}
+  ${LIBELF_LIBRARIES}
+)

@@ -13,12 +13,18 @@
    #ifdef EXCP_DEFAULT_INCLUDE
       #include EXCP_DEFAULT_INCLUDE
    #else
-      #include "exception_errno.h"
+      #include "exception_stderr.h"
    #endif
 #endif
 
 #ifndef EXCP_MOD
    #define EXCP_MOD 0
+#endif
+
+#ifdef __FreeBSD__
+/* ENOTNAM and ENOTUNIQ are not present on FreeBSD */
+#define ENOTNAM EFAULT
+#define ENOTUNIQ EFAULT
 #endif
 
 #endif /* ] _EXCEPTION_H_ */

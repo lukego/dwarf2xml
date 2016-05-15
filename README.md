@@ -8,12 +8,22 @@ License is GPLv2 (according to the author), license file not included, since it 
 
 ## Prerequisites
 
-- awk, sed, grep
+- awk, sed, grep (build)
+- cmake (build)
 - libdwarf
+- libelf
+
+## Building
+
+```
+mkdir build
+cd build
+cmake ..
+make
+```
 
 ## Errors and todo
 
-- Library search does not quite work yet (work in progress), that's why wrong
-  libdwarf.h gets picked up on FreeBSD. Need to find the libraries and set the
-  path.
+- Generate config.h, check if any other macros need to be defined (use config.in.h in top-level directory as a reference)
+- Execution error on FreeBSD, may be other issues on other platforms
 
