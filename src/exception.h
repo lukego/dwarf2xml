@@ -21,8 +21,8 @@
    #define EXCP_MOD 0
 #endif
 
-#if defined(__FreeBSD__) || defined(__APPLE__)
-/* ENOTNAM and ENOTUNIQ are not present on FreeBSD nor OSX */
+#ifdef __FreeBSD__
+/* ENOTNAM and ENOTUNIQ are not present on FreeBSD */
 #define ENOTNAM EFAULT
 #define ENOTUNIQ EFAULT
 #endif
