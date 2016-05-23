@@ -71,7 +71,9 @@ OK : requires libdwarf dwarf-20071016 sinon
 #include <string.h>
 
 #include <libelf.h>
-#include <elf.h>
+#ifndef __APPLE__
+    #include <elf.h> // On OSX, elf.h == gelf.h
+#endif
 #include <gelf.h>
 #include <dwarf.h>
 #include <libdwarf.h>
